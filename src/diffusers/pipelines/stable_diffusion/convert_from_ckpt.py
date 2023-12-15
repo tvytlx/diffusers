@@ -1675,6 +1675,17 @@ def download_from_original_stable_diffusion_ckpt(
                 safety_checker=safety_checker,
                 feature_extractor=feature_extractor,
             )
+        elif adapter:
+            pipe = pipeline_class(
+                vae=vae,
+                text_encoder=text_model,
+                tokenizer=tokenizer,
+                unet=unet,
+                scheduler=scheduler,
+                safety_checker=safety_checker,
+                adapter=adapter,
+                feature_extractor=feature_extractor,
+            )
         else:
             pipe = pipeline_class(
                 vae=vae,

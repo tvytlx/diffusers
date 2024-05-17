@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2023 The HuggingFace Inc. team.
+# Copyright 2024 The HuggingFace Inc. team.
 # Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@ import os
 import re
 from collections import OrderedDict
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import safetensors
@@ -32,18 +33,22 @@ from .. import __version__
 from ..utils import (
     CONFIG_NAME,
     FLAX_WEIGHTS_NAME,
-    MIN_PEFT_VERSION,
     SAFETENSORS_WEIGHTS_NAME,
     WEIGHTS_NAME,
     _add_variant,
     _get_model_file,
-    check_peft_version,
     deprecate,
     is_accelerate_available,
     is_torch_version,
     logging,
 )
-from ..utils.hub_utils import PushToHubMixin
+from ..utils.hub_utils import PushToHubMixin, load_or_create_model_card, populate_model_card
+from .model_loading_utils import (
+    _determine_device_map,
+    _load_state_dict_into_model,
+    load_model_dict_into_meta,
+    load_state_dict,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -57,8 +62,6 @@ else:
 
 if is_accelerate_available():
     import accelerate
-    from accelerate.utils import set_module_tensor_to_device
-    from accelerate.utils.versions import is_torch_version
 
 
 def get_parameter_device(parameter: torch.nn.Module) -> torch.device:
@@ -99,90 +102,6 @@ def get_parameter_dtype(parameter: torch.nn.Module) -> torch.dtype:
         return first_tuple[1].dtype
 
 
-def load_state_dict(checkpoint_file: Union[str, os.PathLike], variant: Optional[str] = None):
-    """
-    Reads a checkpoint file, returning properly formatted errors if they arise.
-    """
-    try:
-        if os.path.basename(checkpoint_file) == _add_variant(WEIGHTS_NAME, variant):
-            return torch.load(checkpoint_file, map_location="cpu")
-        else:
-            return safetensors.torch.load_file(checkpoint_file, device="cpu")
-    except Exception as e:
-        try:
-            with open(checkpoint_file) as f:
-                if f.read().startswith("version"):
-                    raise OSError(
-                        "You seem to have cloned a repository without having git-lfs installed. Please install "
-                        "git-lfs and run `git lfs install` followed by `git lfs pull` in the folder "
-                        "you cloned."
-                    )
-                else:
-                    raise ValueError(
-                        f"Unable to locate the file {checkpoint_file} which is necessary to load this pretrained "
-                        "model. Make sure you have saved the model properly."
-                    ) from e
-        except (UnicodeDecodeError, ValueError):
-            raise OSError(
-                f"Unable to load weights from checkpoint file for '{checkpoint_file}' "
-                f"at '{checkpoint_file}'. "
-                "If you tried to load a PyTorch model from a TF 2.0 checkpoint, please set from_tf=True."
-            )
-
-
-def load_model_dict_into_meta(
-    model,
-    state_dict: OrderedDict,
-    device: Optional[Union[str, torch.device]] = None,
-    dtype: Optional[Union[str, torch.dtype]] = None,
-    model_name_or_path: Optional[str] = None,
-) -> List[str]:
-    device = device or torch.device("cpu")
-    dtype = dtype or torch.float32
-
-    accepts_dtype = "dtype" in set(inspect.signature(set_module_tensor_to_device).parameters.keys())
-
-    unexpected_keys = []
-    empty_state_dict = model.state_dict()
-    for param_name, param in state_dict.items():
-        if param_name not in empty_state_dict:
-            unexpected_keys.append(param_name)
-            continue
-
-        if empty_state_dict[param_name].shape != param.shape:
-            model_name_or_path_str = f"{model_name_or_path} " if model_name_or_path is not None else ""
-            raise ValueError(
-                f"Cannot load {model_name_or_path_str}because {param_name} expected shape {empty_state_dict[param_name]}, but got {param.shape}. If you want to instead overwrite randomly initialized weights, please make sure to pass both `low_cpu_mem_usage=False` and `ignore_mismatched_sizes=True`. For more information, see also: https://github.com/huggingface/diffusers/issues/1619#issuecomment-1345604389 as an example."
-            )
-
-        if accepts_dtype:
-            set_module_tensor_to_device(model, param_name, device, value=param, dtype=dtype)
-        else:
-            set_module_tensor_to_device(model, param_name, device, value=param)
-    return unexpected_keys
-
-
-def _load_state_dict_into_model(model_to_load, state_dict: OrderedDict) -> List[str]:
-    # Convert old format to new format if needed from a PyTorch state_dict
-    # copy state_dict so _load_from_state_dict can modify it
-    state_dict = state_dict.copy()
-    error_msgs = []
-
-    # PyTorch's `_load_from_state_dict` does not copy parameters in a module's descendants
-    # so we need to apply the function recursively.
-    def load(module: torch.nn.Module, prefix: str = ""):
-        args = (state_dict, prefix, {}, True, [], [], error_msgs)
-        module._load_from_state_dict(*args)
-
-        for name, child in module._modules.items():
-            if child is not None:
-                load(child, prefix + name + ".")
-
-    load(model_to_load)
-
-    return error_msgs
-
-
 class ModelMixin(torch.nn.Module, PushToHubMixin):
     r"""
     Base class for all models.
@@ -197,7 +116,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
     _automatically_saved_args = ["_diffusers_version", "_class_name", "_name_or_path"]
     _supports_gradient_checkpointing = False
     _keys_to_ignore_on_load_unexpected = None
-    _hf_peft_config_loaded = False
+    _no_split_modules = None
 
     def __init__(self):
         super().__init__()
@@ -243,6 +162,36 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         """
         if self._supports_gradient_checkpointing:
             self.apply(partial(self._set_gradient_checkpointing, value=False))
+
+    def set_use_npu_flash_attention(self, valid: bool) -> None:
+        r"""
+        Set the switch for the npu flash attention.
+        """
+
+        def fn_recursive_set_npu_flash_attention(module: torch.nn.Module):
+            if hasattr(module, "set_use_npu_flash_attention"):
+                module.set_use_npu_flash_attention(valid)
+
+            for child in module.children():
+                fn_recursive_set_npu_flash_attention(child)
+
+        for module in self.children():
+            if isinstance(module, torch.nn.Module):
+                fn_recursive_set_npu_flash_attention(module)
+
+    def enable_npu_flash_attention(self) -> None:
+        r"""
+        Enable npu flash attention from torch_npu
+
+        """
+        self.set_use_npu_flash_attention(True)
+
+    def disable_npu_flash_attention(self) -> None:
+        r"""
+        disable npu flash attention from torch_npu
+
+        """
+        self.set_use_npu_flash_attention(False)
 
     def set_use_memory_efficient_attention_xformers(
         self, valid: bool, attention_op: Optional[Callable] = None
@@ -302,153 +251,6 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         Disable memory efficient attention from [xFormers](https://facebookresearch.github.io/xformers/).
         """
         self.set_use_memory_efficient_attention_xformers(False)
-
-    def add_adapter(self, adapter_config, adapter_name: str = "default") -> None:
-        r"""
-        Adds a new adapter to the current model for training. If no adapter name is passed, a default name is assigned
-        to the adapter to follow the convention of the PEFT library.
-
-        If you are not familiar with adapters and PEFT methods, we invite you to read more about them in the PEFT
-        [documentation](https://huggingface.co/docs/peft).
-
-        Args:
-            adapter_config (`[~peft.PeftConfig]`):
-                The configuration of the adapter to add; supported adapters are non-prefix tuning and adaption prompt
-                methods.
-            adapter_name (`str`, *optional*, defaults to `"default"`):
-                The name of the adapter to add. If no name is passed, a default name is assigned to the adapter.
-        """
-        check_peft_version(min_version=MIN_PEFT_VERSION)
-
-        from peft import PeftConfig, inject_adapter_in_model
-
-        if not self._hf_peft_config_loaded:
-            self._hf_peft_config_loaded = True
-        elif adapter_name in self.peft_config:
-            raise ValueError(f"Adapter with name {adapter_name} already exists. Please use a different name.")
-
-        if not isinstance(adapter_config, PeftConfig):
-            raise ValueError(
-                f"adapter_config should be an instance of PeftConfig. Got {type(adapter_config)} instead."
-            )
-
-        # Unlike transformers, here we don't need to retrieve the name_or_path of the unet as the loading logic is
-        # handled by the `load_lora_layers` or `LoraLoaderMixin`. Therefore we set it to `None` here.
-        adapter_config.base_model_name_or_path = None
-        inject_adapter_in_model(adapter_config, self, adapter_name)
-        self.set_adapter(adapter_name)
-
-    def set_adapter(self, adapter_name: Union[str, List[str]]) -> None:
-        """
-        Sets a specific adapter by forcing the model to only use that adapter and disables the other adapters.
-
-        If you are not familiar with adapters and PEFT methods, we invite you to read more about them on the PEFT
-        official documentation: https://huggingface.co/docs/peft
-
-        Args:
-            adapter_name (Union[str, List[str]])):
-                The list of adapters to set or the adapter name in case of single adapter.
-        """
-        check_peft_version(min_version=MIN_PEFT_VERSION)
-
-        if not self._hf_peft_config_loaded:
-            raise ValueError("No adapter loaded. Please load an adapter first.")
-
-        if isinstance(adapter_name, str):
-            adapter_name = [adapter_name]
-
-        missing = set(adapter_name) - set(self.peft_config)
-        if len(missing) > 0:
-            raise ValueError(
-                f"Following adapter(s) could not be found: {', '.join(missing)}. Make sure you are passing the correct adapter name(s)."
-                f" current loaded adapters are: {list(self.peft_config.keys())}"
-            )
-
-        from peft.tuners.tuners_utils import BaseTunerLayer
-
-        _adapters_has_been_set = False
-
-        for _, module in self.named_modules():
-            if isinstance(module, BaseTunerLayer):
-                if hasattr(module, "set_adapter"):
-                    module.set_adapter(adapter_name)
-                # Previous versions of PEFT does not support multi-adapter inference
-                elif not hasattr(module, "set_adapter") and len(adapter_name) != 1:
-                    raise ValueError(
-                        "You are trying to set multiple adapters and you have a PEFT version that does not support multi-adapter inference. Please upgrade to the latest version of PEFT."
-                        " `pip install -U peft` or `pip install -U git+https://github.com/huggingface/peft.git`"
-                    )
-                else:
-                    module.active_adapter = adapter_name
-                _adapters_has_been_set = True
-
-        if not _adapters_has_been_set:
-            raise ValueError(
-                "Did not succeeded in setting the adapter. Please make sure you are using a model that supports adapters."
-            )
-
-    def disable_adapters(self) -> None:
-        r"""
-        Disable all adapters attached to the model and fallback to inference with the base model only.
-
-        If you are not familiar with adapters and PEFT methods, we invite you to read more about them on the PEFT
-        official documentation: https://huggingface.co/docs/peft
-        """
-        check_peft_version(min_version=MIN_PEFT_VERSION)
-
-        if not self._hf_peft_config_loaded:
-            raise ValueError("No adapter loaded. Please load an adapter first.")
-
-        from peft.tuners.tuners_utils import BaseTunerLayer
-
-        for _, module in self.named_modules():
-            if isinstance(module, BaseTunerLayer):
-                if hasattr(module, "enable_adapters"):
-                    module.enable_adapters(enabled=False)
-                else:
-                    # support for older PEFT versions
-                    module.disable_adapters = True
-
-    def enable_adapters(self) -> None:
-        """
-        Enable adapters that are attached to the model. The model will use `self.active_adapters()` to retrieve the
-        list of adapters to enable.
-
-        If you are not familiar with adapters and PEFT methods, we invite you to read more about them on the PEFT
-        official documentation: https://huggingface.co/docs/peft
-        """
-        check_peft_version(min_version=MIN_PEFT_VERSION)
-
-        if not self._hf_peft_config_loaded:
-            raise ValueError("No adapter loaded. Please load an adapter first.")
-
-        from peft.tuners.tuners_utils import BaseTunerLayer
-
-        for _, module in self.named_modules():
-            if isinstance(module, BaseTunerLayer):
-                if hasattr(module, "enable_adapters"):
-                    module.enable_adapters(enabled=True)
-                else:
-                    # support for older PEFT versions
-                    module.disable_adapters = False
-
-    def active_adapters(self) -> List[str]:
-        """
-        Gets the current list of active adapters of the model.
-
-        If you are not familiar with adapters and PEFT methods, we invite you to read more about them on the PEFT
-        official documentation: https://huggingface.co/docs/peft
-        """
-        check_peft_version(min_version=MIN_PEFT_VERSION)
-
-        if not self._hf_peft_config_loaded:
-            raise ValueError("No adapter loaded. Please load an adapter first.")
-
-        from peft.tuners.tuners_utils import BaseTunerLayer
-
-        for _, module in self.named_modules():
-            if isinstance(module, BaseTunerLayer):
-                return module.active_adapter
 
     def save_pretrained(
         self,
@@ -517,14 +319,19 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         # Save the model
         if safe_serialization:
             safetensors.torch.save_file(
-                state_dict, os.path.join(save_directory, weights_name), metadata={"format": "pt"}
+                state_dict, Path(save_directory, weights_name).as_posix(), metadata={"format": "pt"}
             )
         else:
-            torch.save(state_dict, os.path.join(save_directory, weights_name))
+            torch.save(state_dict, Path(save_directory, weights_name).as_posix())
 
-        logger.info(f"Model weights saved in {os.path.join(save_directory, weights_name)}")
+        logger.info(f"Model weights saved in {Path(save_directory, weights_name).as_posix()}")
 
         if push_to_hub:
+            # Create a new empty model card and eventually tag it
+            model_card = load_or_create_model_card(repo_id, token=token)
+            model_card = populate_model_card(model_card)
+            model_card.save(Path(save_directory, "README.md").as_posix())
+
             self._upload_folder(
                 save_directory,
                 repo_id,
@@ -560,9 +367,9 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
-            resume_download (`bool`, *optional*, defaults to `False`):
-                Whether or not to resume downloading the model weights and configuration files. If set to `False`, any
-                incompletely downloaded files are deleted.
+            resume_download:
+                Deprecated and ignored. All downloads are now resumed by default when possible. Will be removed in v1
+                of Diffusers.
             proxies (`Dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
@@ -644,7 +451,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         ignore_mismatched_sizes = kwargs.pop("ignore_mismatched_sizes", False)
         force_download = kwargs.pop("force_download", False)
         from_flax = kwargs.pop("from_flax", False)
-        resume_download = kwargs.pop("resume_download", False)
+        resume_download = kwargs.pop("resume_download", None)
         proxies = kwargs.pop("proxies", None)
         output_loading_info = kwargs.pop("output_loading_info", False)
         local_files_only = kwargs.pop("local_files_only", None)
@@ -699,6 +506,36 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 " dispatching. Please make sure to set `low_cpu_mem_usage=True`."
             )
 
+        # change device_map into a map if we passed an int, a str or a torch.device
+        if isinstance(device_map, torch.device):
+            device_map = {"": device_map}
+        elif isinstance(device_map, str) and device_map not in ["auto", "balanced", "balanced_low_0", "sequential"]:
+            try:
+                device_map = {"": torch.device(device_map)}
+            except RuntimeError:
+                raise ValueError(
+                    "When passing device_map as a string, the value needs to be a device name (e.g. cpu, cuda:0) or "
+                    f"'auto', 'balanced', 'balanced_low_0', 'sequential' but found {device_map}."
+                )
+        elif isinstance(device_map, int):
+            if device_map < 0:
+                raise ValueError(
+                    "You can't pass device_map as a negative int. If you want to put the model on the cpu, pass device_map = 'cpu' "
+                )
+            else:
+                device_map = {"": device_map}
+
+        if device_map is not None:
+            if low_cpu_mem_usage is None:
+                low_cpu_mem_usage = True
+            elif not low_cpu_mem_usage:
+                raise ValueError("Passing along a `device_map` requires `low_cpu_mem_usage=True`")
+
+        if low_cpu_mem_usage:
+            if device_map is not None and not is_torch_version(">=", "1.10"):
+                # The max memory utils require PyTorch >= 1.10 to have torch.cuda.mem_get_info.
+                raise ValueError("`low_cpu_mem_usage` and `device_map` require PyTorch >= 1.10.")
+
         # Load config if we don't provide a configuration
         config_path = pretrained_model_name_or_path
 
@@ -721,10 +558,6 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             token=token,
             revision=revision,
             subfolder=subfolder,
-            device_map=device_map,
-            max_memory=max_memory,
-            offload_folder=offload_folder,
-            offload_state_dict=offload_state_dict,
             user_agent=user_agent,
             **kwargs,
         )
@@ -822,13 +655,14 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                             unexpected_keys = [k for k in unexpected_keys if re.search(pat, k) is None]
 
                     if len(unexpected_keys) > 0:
-                        logger.warn(
+                        logger.warning(
                             f"Some weights of the model checkpoint were not used when initializing {cls.__name__}: \n {[', '.join(unexpected_keys)]}"
                         )
 
                 else:  # else let accelerate handle loading and dispatching.
                     # Load weights and dispatch according to the device_map
                     # by default the device_map is None and the weights are loaded on the CPU
+                    device_map = _determine_device_map(model, device_map, max_memory, torch_dtype)
                     try:
                         accelerate.load_checkpoint_and_dispatch(
                             model,
@@ -838,6 +672,8 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                             offload_folder=offload_folder,
                             offload_state_dict=offload_state_dict,
                             dtype=torch_dtype,
+                            force_hooks=True,
+                            strict=True,
                         )
                     except AttributeError as e:
                         # When using accelerate loading, we do not have the ability to load the state
@@ -850,7 +686,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                         # the weights so we don't have to do this again.
 
                         if "'Attention' object has no attribute" in str(e):
-                            logger.warn(
+                            logger.warning(
                                 f"Taking `{str(e)}` while using `accelerate.load_checkpoint_and_dispatch` to mean {pretrained_model_name_or_path}"
                                 " was saved with deprecated attention block weight names. We will load it with the deprecated attention block"
                                 " names and convert them on the fly to the new attention block format. Please re-save the model after this conversion,"
@@ -1017,6 +853,45 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             )
 
         return model, missing_keys, unexpected_keys, mismatched_keys, error_msgs
+
+    @classmethod
+    def _get_signature_keys(cls, obj):
+        parameters = inspect.signature(obj.__init__).parameters
+        required_parameters = {k: v for k, v in parameters.items() if v.default == inspect._empty}
+        optional_parameters = set({k for k, v in parameters.items() if v.default != inspect._empty})
+        expected_modules = set(required_parameters.keys()) - {"self"}
+
+        return expected_modules, optional_parameters
+
+    # Adapted from `transformers` modeling_utils.py
+    def _get_no_split_modules(self, device_map: str):
+        """
+        Get the modules of the model that should not be spit when using device_map. We iterate through the modules to
+        get the underlying `_no_split_modules`.
+
+        Args:
+            device_map (`str`):
+                The device map value. Options are ["auto", "balanced", "balanced_low_0", "sequential"]
+
+        Returns:
+            `List[str]`: List of modules that should not be split
+        """
+        _no_split_modules = set()
+        modules_to_check = [self]
+        while len(modules_to_check) > 0:
+            module = modules_to_check.pop(-1)
+            # if the module does not appear in _no_split_modules, we also check the children
+            if module.__class__.__name__ not in _no_split_modules:
+                if isinstance(module, ModelMixin):
+                    if module._no_split_modules is None:
+                        raise ValueError(
+                            f"{module.__class__.__name__} does not support `device_map='{device_map}'`. To implement support, the model "
+                            "class needs to implement the `_no_split_modules` attribute."
+                        )
+                    else:
+                        _no_split_modules = _no_split_modules | set(module._no_split_modules)
+                modules_to_check += list(module.children())
+        return list(_no_split_modules)
 
     @property
     def device(self) -> torch.device:

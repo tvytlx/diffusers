@@ -1,4 +1,4 @@
-# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ from .constants import (
     MIN_PEFT_VERSION,
     ONNX_EXTERNAL_WEIGHTS_NAME,
     ONNX_WEIGHTS_NAME,
+    SAFETENSORS_FILE_EXTENSION,
     SAFETENSORS_WEIGHTS_NAME,
     USE_PEFT_BACKEND,
     WEIGHTS_NAME,
@@ -57,24 +58,31 @@ from .import_utils import (
     get_objects_from_module,
     is_accelerate_available,
     is_accelerate_version,
+    is_bitsandbytes_available,
     is_bs4_available,
     is_flax_available,
     is_ftfy_available,
+    is_google_colab,
     is_inflect_available,
     is_invisible_watermark_available,
     is_k_diffusion_available,
     is_k_diffusion_version,
     is_librosa_available,
     is_note_seq_available,
-    is_omegaconf_available,
+    is_notebook,
     is_onnx_available,
     is_peft_available,
+    is_peft_version,
+    is_safetensors_available,
     is_scipy_available,
     is_tensorboard_available,
+    is_timm_available,
     is_torch_available,
+    is_torch_npu_available,
     is_torch_version,
     is_torch_xla_available,
     is_torchsde_available,
+    is_torchvision_available,
     is_transformers_available,
     is_transformers_version,
     is_unidecode_available,
@@ -98,7 +106,9 @@ from .peft_utils import (
 )
 from .pil_utils import PIL_INTERPOLATION, make_image_grid, numpy_to_pil, pt_to_pil
 from .state_dict_utils import (
+    convert_all_state_dict_to_peft,
     convert_state_dict_to_diffusers,
+    convert_state_dict_to_kohya,
     convert_state_dict_to_peft,
     convert_unet_state_dict_to_peft,
 )
